@@ -1246,7 +1246,7 @@ async def endpoint_cerca(
 async def endpoint_simili(
     q: str = Query(..., description="Nome del gioco (o AppID)"),
     depth: int = Query(2, ge=1, le=4, description="Profondità BFS (1-4)"),
-    max: Optional[int] = Query(None, ge=1, description="Max giochi trovati (None=illimitato)"),
+    max_total: Optional[int] = Query(None, ge=1, alias="max", description="Max giochi trovati. Nell\'URL usa ?max=50"),
     lang: str = Query(DEFAULT_LANG),
     cc: str = Query(DEFAULT_CC),
     downloads: bool = Query(True, description="Ricerca download automatica"),
@@ -1295,7 +1295,7 @@ async def endpoint_simili(
 
         # BFS
         t1 = time.time()
-        discovered = await bfs_discover(peek_client, appid, seed_name, depth, max)
+        discovered = await bfs_discover(peek_client, appid, seed_name, depth, max_total)
         t2 = time.time()
         log.info("BFS: %d giochi trovati in %.2fs", len(discovered), t2 - t1)
 
@@ -1304,7 +1304,7 @@ async def endpoint_simili(
             http_client, appid,
             name_hint=seed_name,
             include_downloads=downloads,
-            dl_max=max(dl_max, 10),  # più varianti per il seed
+            dl_max=(dl_max if dl_max >= 10 else 10),  # più varianti per il seed
             lang=lang, cc=cc,
             extra={"depth": 0, "parent": None, "name": seed_name},
         )
@@ -1368,7 +1368,7 @@ async def endpoint_simili(
             "download_rate_pct": round(with_dl * 100 / max(len(filtered), 1), 1),
             "elapsed_seconds": round(time.time() - t0, 2),
             "params": {
-                "depth": depth, "max": max, "sort": sort, "desc": desc,
+                "depth": depth, "max": max_total, "sort": sort, "desc": desc,
                 "full_details": full, "downloads": downloads,
             },
         },
@@ -1419,12 +1419,12 @@ async def endpoint_simili_async(
                         raise RuntimeError(f"Cannot resolve: {q}")
 
                 jobs[job_id]["progress"] = f"BFS depth={depth}..."
-                discovered = await bfs_discover(peek_c, appid, seed_name, depth, max)
+                discovered = await bfs_discover(peek_c, appid, seed_name, depth, max_total)
 
                 jobs[job_id]["progress"] = f"Enriching {len(discovered) + 1} games..."
                 seed_task = enrich_single_game(
                     http_c, appid, name_hint=seed_name,
-                    include_downloads=downloads, dl_max=max_variants if (max_variants:=dl_max) else 10,
+                    include_downloads=downloads, dl_max=(dl_max if dl_max >= 10 else 10),
                     lang=lang, cc=cc,
                     extra={"depth": 0, "parent": None, "name": seed_name},
                 )
