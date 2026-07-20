@@ -49,7 +49,7 @@ DEFAULT_LANG = "italian"
 DEFAULT_CC = "IT"
 
 # Concurrency (tuned for Railway)
-CONCURRENCY_PEEK = 12
+CONCURRENCY_PEEK = 16
 CONCURRENCY_SPY = 40
 CONCURRENCY_STORE = 20
 CONCURRENCY_DL = 8
@@ -580,20 +580,103 @@ def parse_peek(html: str, src: int) -> list[dict]:
     return list(games.values())
 
 
-async def fetch_similar(session: CurlAsync, appid: int, sem: asyncio.Semaphore) -> list[dict]:
+
+
+def parse_total_pages(html: str) -> int:
+    """Estrae il numero totale di pagine dalla paginazione SteamPeek."""
+    try:
+        soup = BS(html, "lxml")
+        # Cerca "page X / Y" o simili
+        text = soup.get_text(" ", strip=True)
+        m = re.search(r"page\s*\d+\s*/\s*(\d+)", text, re.I)
+        if m:
+            return int(m.group(1))
+        # Cerca select con opzioni pagina
+        select = soup.select_one("select")
+        if select:
+            opts = select.find_all("option")
+            if opts:
+                nums = [int(o.get("value", 0)) for o in opts if o.get("value", "").isdigit()]
+                if nums:
+                    return max(nums)
+        # Cerca link "Next" con page=N
+        for a in soup.find_all("a", href=True):
+            m = re.search(r"[?&]page=(\d+)", a["href"])
+            if m:
+                p = int(m.group(1))
+                # tieni traccia del massimo
+                if not hasattr(parse_total_pages, "_max"):
+                    parse_total_pages._max = 1
+                parse_total_pages._max = max(parse_total_pages._max, p)
+        return getattr(parse_total_pages, "_max", 1)
+    except Exception:
+        return 1
+    finally:
+        if hasattr(parse_total_pages, "_max"):
+            del parse_total_pages._max
+
+
+async def fetch_similar_page(
+    session: CurlAsync,
+    appid: int,
+    page: int,
+    sem: asyncio.Semaphore,
+) -> tuple[list[dict], str]:
+    """Fetch una singola pagina di simili. Ritorna (games, html)."""
     async with sem:
         for i in range(RETRY_ATTEMPTS):
             try:
+                url = f"{BASE_URL}/?appid={appid}"
+                if page > 1:
+                    url += f"&page={page}"
                 r = await session.get(
-                    f"{BASE_URL}/?appid={appid}",
+                    url,
                     headers={"referer": BASE_URL + "/"},
                     timeout=TIMEOUT,
                 )
                 await asyncio.sleep(DELAY_PEEK)
-                return parse_peek(r.text, appid)
+                return parse_peek(r.text, appid), r.text
             except Exception:
                 await asyncio.sleep(0.4 * (2 ** i))
-        return []
+        return [], ""
+
+
+async def fetch_similar(
+    session: CurlAsync,
+    appid: int,
+    sem: asyncio.Semaphore,
+    max_pages: int = 10,
+) -> list[dict]:
+    """
+    Fetch TUTTE le pagine di simili per un appid.
+    Rileva automaticamente il numero totale di pagine.
+    """
+    # Pagina 1 + detect total pages
+    games_p1, html_p1 = await fetch_similar_page(session, appid, 1, sem)
+    total_pages = parse_total_pages(html_p1)
+    total_pages = min(total_pages, max_pages)
+
+    all_games = {g["appid"]: g for g in games_p1}
+
+    if total_pages <= 1:
+        return list(all_games.values())
+
+    # Pagine 2..N in parallelo
+    tasks = [
+        fetch_similar_page(session, appid, p, sem)
+        for p in range(2, total_pages + 1)
+    ]
+
+    for coro in asyncio.as_completed(tasks):
+        try:
+            games, _ = await coro
+            for g in games:
+                if g["appid"] not in all_games:
+                    all_games[g["appid"]] = g
+        except Exception:
+            continue
+
+    return list(all_games.values())
 
 
 async def bfs_discover(
@@ -602,6 +685,7 @@ async def bfs_discover(
     seed_name: str,
     depth: int,
     max_total: int | None = None,
+    max_pages_per_game: int = 5,
 ) -> list[dict]:
     all_g: dict[int, dict] = {
         seed_id: {"appid": seed_id, "name": seed_name, "depth": 0, "parent": None}
@@ -620,7 +704,7 @@ async def bfs_discover(
         log.info("BFS L%d/%d — expanding %d nodes", lvl + 1, depth, len(current))
 
         async def job(parent: int):
-            return parent, await fetch_similar(peek, parent, sem)
+            return parent, await fetch_similar(peek, parent, sem, max_pages=max_pages_per_game)
 
         tasks = [job(a) for a in current]
         nxt: list[int] = []
@@ -1295,7 +1379,10 @@ async def endpoint_simili(
 
         # BFS
         t1 = time.time()
-        discovered = await bfs_discover(peek_client, appid, seed_name, depth, max_total)
+        discovered = await bfs_discover(
+                peek_client, appid, seed_name, depth, max_total,
+                max_pages_per_game=max_pages_per_game,
+            )
         t2 = time.time()
         log.info("BFS: %d giochi trovati in %.2fs", len(discovered), t2 - t1)
 
@@ -1419,7 +1506,10 @@ async def endpoint_simili_async(
                         raise RuntimeError(f"Cannot resolve: {q}")
 
                 jobs[job_id]["progress"] = f"BFS depth={depth}..."
-                discovered = await bfs_discover(peek_c, appid, seed_name, depth, max_total)
+                discovered = await bfs_discover(
+                peek_c, appid, seed_name, depth, max_total,
+                max_pages_per_game=max_pages_per_game,
+            )
 
                 jobs[job_id]["progress"] = f"Enriching {len(discovered) + 1} games..."
                 seed_task = enrich_single_game(
