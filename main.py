@@ -1,17 +1,20 @@
 """
-SteamPeek API v5 PRO — Railway Edition
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SteamPeek API v6 — Railway Edition
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Due endpoint principali, tutto automatico:
-  • GET /cerca?q=NOME         → singolo gioco con TUTTE le info + downloads
-  • GET /simili?q=NOME        → gioco + tutti i simili (BFS) con downloads
+• GET /cerca?q=NOME         → info complete di UN gioco
+• GET /simili?q=NOME        → gioco + TUTTI i simili (multi-pagina)
+• POST /simili/async        → job background per operazioni pesanti
 
-Ogni chiamata restituisce:
-  - SteamSpy (owners, playtime, tags, reviews, ecc)
-  - Steam Store API (descrizione, screenshots, requisiti, DLC, ecc)
-  - GameVault (download links automatici con matching intelligente)
-  - Immagini CDN (header, capsule, hero, library, screenshots)
-  - Link utili (SteamDB, ProtonDB, ITAD, SteamCharts, ecc)
+TUTTO include automaticamente:
+  - SteamSpy (owners, playtime, tags, reviews)
+  - Steam Store (descrizione, screenshots, requisiti, DLC)
+  - Steam Reviews summary
+  - GameVault downloads (matching intelligente)
+  - Immagini CDN, link esterni (SteamDB, ProtonDB, ITAD, ecc)
+
+PAGINAZIONE: legge automaticamente TUTTE le pagine SteamPeek
+(default 5, max 20) per ogni gioco → decine/centinaia di simili.
 """
 
 import asyncio
@@ -29,7 +32,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, ORJSONResponse
+from fastapi.responses import ORJSONResponse
 from bs4 import BeautifulSoup as BS
 from curl_cffi.requests import AsyncSession as CurlAsync
 import httpx
@@ -48,14 +51,13 @@ IMPERSONATE = "chrome131"
 DEFAULT_LANG = "italian"
 DEFAULT_CC = "IT"
 
-# Concurrency (tuned for Railway)
 CONCURRENCY_PEEK = 16
 CONCURRENCY_SPY = 40
 CONCURRENCY_STORE = 20
 CONCURRENCY_DL = 8
 CONCURRENCY_REVIEWS = 15
+CONCURRENCY_PAGES = 8
 
-# Delays
 DELAY_PEEK = 0.04
 DELAY_SPY = 0.02
 DELAY_STORE = 0.05
@@ -64,16 +66,14 @@ DELAY_DL = 0.12
 TIMEOUT = 25
 RETRY_ATTEMPTS = 3
 
-# Cache
 CACHE_DIR = Path("/tmp/steampeek_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_ALL = CACHE_DIR / "steamspy_all.json"
-CACHE_ALL_TTL = 86400  # 24h
-CACHE_GAME_TTL = 3600  # 1h per singolo gioco
+CACHE_ALL_TTL = 86400
+CACHE_GAME_TTL = 3600
 
-# In-memory cache
 _memory_cache: dict[str, tuple[float, Any]] = {}
-CACHE_MAX_ENTRIES = 500
+CACHE_MAX_ENTRIES = 1000
 
 HDR = {
     "accept": "application/json,text/plain,*/*",
@@ -93,7 +93,7 @@ log = logging.getLogger("steampeek")
 
 
 # ═══════════════════════════════════════════════════════════════
-# CACHE HELPERS
+# CACHE
 # ═══════════════════════════════════════════════════════════════
 def cache_get(key: str, ttl: int = CACHE_GAME_TTL):
     if key in _memory_cache:
@@ -106,7 +106,6 @@ def cache_get(key: str, ttl: int = CACHE_GAME_TTL):
 
 def cache_set(key: str, value: Any):
     if len(_memory_cache) >= CACHE_MAX_ENTRIES:
-        # rimuovi il 20% più vecchio
         sorted_keys = sorted(_memory_cache.items(), key=lambda x: x[1][0])
         for k, _ in sorted_keys[: CACHE_MAX_ENTRIES // 5]:
             del _memory_cache[k]
@@ -126,15 +125,6 @@ def safe_int(x, d=0):
         if x is None or x == "":
             return d
         return int(str(x).replace(",", ""))
-    except Exception:
-        return d
-
-
-def safe_float(x, d=0.0):
-    try:
-        if x is None or x == "":
-            return d
-        return float(str(x).replace(",", ""))
     except Exception:
         return d
 
@@ -182,21 +172,14 @@ def parse_steam_date(s: str | None) -> int:
     return 0
 
 
-async def with_retry(coro_func, *args, attempts=RETRY_ATTEMPTS, base_delay=0.4, **kwargs):
-    """Retry wrapper con backoff esponenziale"""
-    last_err = None
-    for i in range(attempts):
-        try:
-            return await coro_func(*args, **kwargs)
-        except Exception as e:
-            last_err = e
-            if i < attempts - 1:
-                await asyncio.sleep(base_delay * (2 ** i))
-    raise last_err
+def clean_html(s: str | None) -> str:
+    if not s:
+        return ""
+    return BS(s, "lxml").get_text(" ", strip=True)
 
 
 # ═══════════════════════════════════════════════════════════════
-# GAMEVAULT — MATCHING INTELLIGENTE
+# GAMEVAULT
 # ═══════════════════════════════════════════════════════════════
 def normalize_for_match(s: str) -> str:
     if not s:
@@ -278,7 +261,6 @@ async def gamevault_search(
     max_variants: int = 8,
     min_similarity: float = 0.55,
 ):
-    """Cerca su GameVault con matching intelligente multi-query"""
     cache_key = make_cache_key("gv", game_name, max_variants)
     cached = cache_get(cache_key)
     if cached is not None:
@@ -319,8 +301,7 @@ async def gamevault_search(
                         "match_confidence": (
                             "perfect" if scored[0][0] >= 0.95 else
                             "high" if scored[0][0] >= 0.8 else
-                            "medium" if scored[0][0] >= 0.65 else
-                            "low"
+                            "medium" if scored[0][0] >= 0.65 else "low"
                         ),
                         "total_found": len(valid),
                         "variants": [
@@ -356,7 +337,7 @@ async def steamspy_all(client: httpx.AsyncClient) -> dict:
                 return json.loads(CACHE_ALL.read_text(encoding="utf-8"))
             except Exception:
                 pass
-    log.info("Fetching full SteamSpy catalog (may take ~30s)...")
+    log.info("Fetching full SteamSpy catalog...")
     r = await client.get(
         STEAMSPY_API, params={"request": "all"}, headers=HDR, timeout=90
     )
@@ -367,10 +348,6 @@ async def steamspy_all(client: httpx.AsyncClient) -> dict:
 
 
 async def resolve_appid(client: httpx.AsyncClient, query: str):
-    """
-    Resolve intelligente: prova prima Steam Store search (più preciso),
-    poi fallback SteamSpy catalog.
-    """
     cache_key = make_cache_key("resolve", query)
     cached = cache_get(cache_key)
     if cached is not None:
@@ -378,7 +355,6 @@ async def resolve_appid(client: httpx.AsyncClient, query: str):
 
     q = query.strip()
 
-    # 1. Steam Store Search API (più affidabile per titoli recenti)
     try:
         r = await client.get(
             STEAM_SEARCH,
@@ -390,11 +366,7 @@ async def resolve_appid(client: httpx.AsyncClient, query: str):
             data = r.json()
             items = data.get("items", [])
             if items:
-                # scegli quello più simile
-                scored = [
-                    (similarity(q, it.get("name", "")), it)
-                    for it in items
-                ]
+                scored = [(similarity(q, it.get("name", "")), it) for it in items]
                 scored.sort(key=lambda x: -x[0])
                 best_sim, best_item = scored[0]
                 if best_sim >= 0.5:
@@ -404,7 +376,6 @@ async def resolve_appid(client: httpx.AsyncClient, query: str):
     except Exception as e:
         log.warning("Steam search failed: %s", e)
 
-    # 2. Fallback SteamSpy catalog
     try:
         data = await steamspy_all(client)
         ql = q.lower()
@@ -461,13 +432,9 @@ async def steamspy_details(client: httpx.AsyncClient, appid: int):
     return None
 
 
-# ═══════════════════════════════════════════════════════════════
-# STEAM STORE API (info complete)
-# ═══════════════════════════════════════════════════════════════
 async def steam_store_details(
     client: httpx.AsyncClient, appid: int, lang: str = "italian", cc: str = "IT"
 ):
-    """Fetch complete Steam Store data: description, screenshots, requirements, DLC, ecc"""
     cache_key = make_cache_key("store", appid, lang, cc)
     cached = cache_get(cache_key)
     if cached is not None:
@@ -496,7 +463,6 @@ async def steam_store_details(
 
 
 async def steam_reviews_summary(client: httpx.AsyncClient, appid: int):
-    """Fetch Steam review summary (score description, tot pos/neg)"""
     cache_key = make_cache_key("rev", appid)
     cached = cache_get(cache_key)
     if cached is not None:
@@ -506,10 +472,8 @@ async def steam_reviews_summary(client: httpx.AsyncClient, appid: int):
         r = await client.get(
             f"{STEAM_REVIEWS}/{appid}",
             params={
-                "json": 1,
-                "language": "all",
-                "purchase_type": "all",
-                "num_per_page": 0,
+                "json": 1, "language": "all",
+                "purchase_type": "all", "num_per_page": 0,
             },
             headers=HDR,
             timeout=15,
@@ -525,7 +489,7 @@ async def steam_reviews_summary(client: httpx.AsyncClient, appid: int):
 
 
 # ═══════════════════════════════════════════════════════════════
-# STEAMPEEK — BFS DISCOVERY
+# STEAMPEEK PARSING + PAGINAZIONE
 # ═══════════════════════════════════════════════════════════════
 def extract_name(cont) -> str:
     img = cont.find("img", alt=re.compile(r".+"))
@@ -580,49 +544,40 @@ def parse_peek(html: str, src: int) -> list[dict]:
     return list(games.values())
 
 
-
-
 def parse_total_pages(html: str) -> int:
-    """Estrae il numero totale di pagine dalla paginazione SteamPeek."""
+    """Rileva il numero totale di pagine da un HTML SteamPeek."""
+    if not html:
+        return 1
     try:
         soup = BS(html, "lxml")
-        # Cerca "page X / Y" o simili
         text = soup.get_text(" ", strip=True)
+        # cerca "page X / Y"
         m = re.search(r"page\s*\d+\s*/\s*(\d+)", text, re.I)
         if m:
             return int(m.group(1))
-        # Cerca select con opzioni pagina
-        select = soup.select_one("select")
-        if select:
-            opts = select.find_all("option")
-            if opts:
-                nums = [int(o.get("value", 0)) for o in opts if o.get("value", "").isdigit()]
-                if nums:
-                    return max(nums)
-        # Cerca link "Next" con page=N
+        # cerca link ?page=N
+        max_page = 1
         for a in soup.find_all("a", href=True):
             m = re.search(r"[?&]page=(\d+)", a["href"])
             if m:
-                p = int(m.group(1))
-                # tieni traccia del massimo
-                if not hasattr(parse_total_pages, "_max"):
-                    parse_total_pages._max = 1
-                parse_total_pages._max = max(parse_total_pages._max, p)
-        return getattr(parse_total_pages, "_max", 1)
+                max_page = max(max_page, int(m.group(1)))
+        # cerca select con options
+        for opt in soup.select("select option"):
+            val = opt.get("value", "")
+            if val.isdigit():
+                max_page = max(max_page, int(val))
+        return max_page
     except Exception:
         return 1
-    finally:
-        if hasattr(parse_total_pages, "_max"):
-            del parse_total_pages._max
 
 
-async def fetch_similar_page(
+async def fetch_peek_page(
     session: CurlAsync,
     appid: int,
     page: int,
     sem: asyncio.Semaphore,
 ) -> tuple[list[dict], str]:
-    """Fetch una singola pagina di simili. Ritorna (games, html)."""
+    """Fetch UNA pagina di simili. Ritorna (games, raw_html)."""
     async with sem:
         for i in range(RETRY_ATTEMPTS):
             try:
@@ -641,44 +596,51 @@ async def fetch_similar_page(
         return [], ""
 
 
-async def fetch_similar(
+async def fetch_all_similar(
     session: CurlAsync,
     appid: int,
     sem: asyncio.Semaphore,
-    max_pages: int = 10,
+    max_pages: int = 5,
 ) -> list[dict]:
     """
-    Fetch TUTTE le pagine di simili per un appid.
-    Rileva automaticamente il numero totale di pagine.
+    Scarica TUTTE le pagine di simili per un appid.
+    Rileva automaticamente quante pagine ci sono.
     """
-    # Pagina 1 + detect total pages
-    games_p1, html_p1 = await fetch_similar_page(session, appid, 1, sem)
-    total_pages = parse_total_pages(html_p1)
-    total_pages = min(total_pages, max_pages)
+    # 1. Pagina 1 + detect
+    p1_games, p1_html = await fetch_peek_page(session, appid, 1, sem)
+    total_pages = min(parse_total_pages(p1_html), max_pages)
 
-    all_games = {g["appid"]: g for g in games_p1}
+    all_games: dict[int, dict] = {g["appid"]: g for g in p1_games}
 
     if total_pages <= 1:
         return list(all_games.values())
 
-    # Pagine 2..N in parallelo
-    tasks = [
-        fetch_similar_page(session, appid, p, sem)
-        for p in range(2, total_pages + 1)
-    ]
+    # 2. Pagine 2..N in parallelo
+    page_sem = asyncio.Semaphore(CONCURRENCY_PAGES)
 
-    for coro in asyncio.as_completed(tasks):
-        try:
-            games, _ = await coro
-            for g in games:
-                if g["appid"] not in all_games:
-                    all_games[g["appid"]] = g
-        except Exception:
+    async def fetch_page(p: int):
+        async with page_sem:
+            games, _ = await fetch_peek_page(session, appid, p, sem)
+            return games
+
+    results = await asyncio.gather(
+        *[fetch_page(p) for p in range(2, total_pages + 1)],
+        return_exceptions=True,
+    )
+
+    for res in results:
+        if isinstance(res, Exception):
             continue
+        for g in res:
+            if g["appid"] not in all_games:
+                all_games[g["appid"]] = g
 
     return list(all_games.values())
 
 
+# ═══════════════════════════════════════════════════════════════
+# BFS DISCOVERY
+# ═══════════════════════════════════════════════════════════════
 async def bfs_discover(
     peek: CurlAsync,
     seed_id: int,
@@ -704,7 +666,8 @@ async def bfs_discover(
         log.info("BFS L%d/%d — expanding %d nodes", lvl + 1, depth, len(current))
 
         async def job(parent: int):
-            return parent, await fetch_similar(peek, parent, sem, max_pages=max_pages_per_game)
+            games = await fetch_all_similar(peek, parent, sem, max_pages=max_pages_per_game)
+            return parent, games
 
         tasks = [job(a) for a in current]
         nxt: list[int] = []
@@ -729,7 +692,7 @@ async def bfs_discover(
 
 
 # ═══════════════════════════════════════════════════════════════
-# BUILD RECORD — TUTTE le informazioni
+# BUILD RECORD
 # ═══════════════════════════════════════════════════════════════
 def _owners_min(owners_str) -> int:
     if not owners_str:
@@ -740,12 +703,6 @@ def _owners_min(owners_str) -> int:
     return 0
 
 
-def clean_html(s: str | None) -> str:
-    if not s:
-        return ""
-    return BS(s, "lxml").get_text(" ", strip=True)
-
-
 def build_full_record(
     appid: int,
     spy: dict | None,
@@ -754,17 +711,14 @@ def build_full_record(
     dl_info: dict | None,
     extra: dict | None = None,
 ) -> dict:
-    """Costruisce il record COMPLETO combinando tutte le fonti"""
     spy = spy or {}
     store = store or {}
     reviews_summary = reviews_summary or {}
     extra = extra or {}
     appid = int(appid)
 
-    # Nome (prefer store, fallback spy, fallback extra)
     name = store.get("name") or spy.get("name") or extra.get("name") or f"#{appid}"
 
-    # Reviews (combina SteamSpy + Steam)
     pos = safe_int(spy.get("positive"))
     neg = safe_int(spy.get("negative"))
     total = pos + neg
@@ -772,12 +726,8 @@ def build_full_record(
 
     steam_total = safe_int(reviews_summary.get("total_reviews"))
     steam_pos = safe_int(reviews_summary.get("total_positive"))
-    steam_score = None
-    if steam_total > 0:
-        steam_score = round((steam_pos / steam_total) * 100, 2)
+    steam_score = round((steam_pos / steam_total) * 100, 2) if steam_total > 0 else None
 
-    # Prezzo (prefer store se disponibile per accuratezza + valuta)
-    price_info = {}
     if store.get("is_free"):
         price_info = {
             "final": 0, "initial": 0, "discount_percent": 0,
@@ -808,37 +758,27 @@ def build_full_record(
             "is_free": final == 0,
         }
 
-    # Tags SteamSpy
     tags_raw = spy.get("tags") or {}
     tags = (
         [{"name": k, "votes": v} for k, v in sorted(tags_raw.items(), key=lambda x: -x[1])[:30]]
         if isinstance(tags_raw, dict) else []
     )
 
-    # Genres, categories (Steam Store)
     store_genres = [g.get("description") for g in store.get("genres", []) if g.get("description")]
     store_categories = [c.get("description") for c in store.get("categories", []) if c.get("description")]
-
     spy_genres = [x.strip() for x in str(spy.get("genre") or "").split(",") if x.strip()]
-    genres = list(dict.fromkeys(store_genres + spy_genres))  # merge senza duplicati
+    genres = list(dict.fromkeys(store_genres + spy_genres))
 
-    # Release date
     rd = store.get("release_date", {})
-    release_date = rd.get("date")
+    release_date = rd.get("date") or spy.get("release_date")
     release_ts = parse_steam_date(release_date)
     coming_soon = rd.get("coming_soon", False)
 
-    # Screenshots
     screenshots = [
-        {
-            "id": s.get("id"),
-            "thumbnail": s.get("path_thumbnail"),
-            "full": s.get("path_full"),
-        }
+        {"id": s.get("id"), "thumbnail": s.get("path_thumbnail"), "full": s.get("path_full")}
         for s in (store.get("screenshots") or [])
     ]
 
-    # Movies (trailer)
     movies = [
         {
             "id": m.get("id"),
@@ -852,7 +792,6 @@ def build_full_record(
         for m in (store.get("movies") or [])
     ]
 
-    # System requirements
     def parse_reqs(req):
         if not req or not isinstance(req, dict):
             return None
@@ -861,31 +800,10 @@ def build_full_record(
             "recommended": clean_html(req.get("recommended")),
         }
 
-    requirements = {
-        "pc": parse_reqs(store.get("pc_requirements")),
-        "mac": parse_reqs(store.get("mac_requirements")),
-        "linux": parse_reqs(store.get("linux_requirements")),
-    }
-
-    # Platforms
     platforms = store.get("platforms") or {}
-
-    # DLC
     dlc_list = store.get("dlc") or []
-
-    # Metacritic
-    metacritic = store.get("metacritic")
-
-    # Achievements
     achievements = store.get("achievements") or {}
 
-    # Support info
-    support = store.get("support_info") or {}
-
-    # Content descriptors (age rating)
-    content_desc = store.get("content_descriptors") or {}
-
-    # Package groups (edizioni disponibili)
     packages = []
     for pg in store.get("package_groups", []) or []:
         for sub in pg.get("subs", []) or []:
@@ -896,48 +814,34 @@ def build_full_record(
                 "is_free_license": sub.get("is_free_license", False),
             })
 
-    # ─── RECORD FINALE ───
     return {
-        # Identity
         "appid": appid,
         "name": name,
         "type": store.get("type", "game"),
-        "steam_appid": store.get("steam_appid") or appid,
         "required_age": store.get("required_age", 0),
-
-        # Descriptions
         "short_description": store.get("short_description"),
         "detailed_description": clean_html(store.get("detailed_description")),
         "about_the_game": clean_html(store.get("about_the_game")),
         "supported_languages": clean_html(store.get("supported_languages")),
         "languages_spy": spy.get("languages"),
         "website": store.get("website"),
-
-        # Devs / Pubs
-        "developers": store.get("developers") or ([spy.get("developer")] if spy.get("developer") else []),
-        "publishers": store.get("publishers") or ([spy.get("publisher")] if spy.get("publisher") else []),
-
-        # Categorization
+        "developers": store.get("developers") or (
+            [spy.get("developer")] if spy.get("developer") else []
+        ),
+        "publishers": store.get("publishers") or (
+            [spy.get("publisher")] if spy.get("publisher") else []
+        ),
         "genres": genres,
         "categories": store_categories,
         "tags": tags,
-
-        # Release
         "release_date": release_date,
-        "release_date_spy": spy.get("release_date"),
         "release_ts": release_ts,
         "coming_soon": coming_soon,
-
-        # Price
         "price": price_info,
         "packages": packages,
-
-        # Reviews combined
         "reviews": {
             "steamspy": {
-                "positive": pos,
-                "negative": neg,
-                "total": total,
+                "positive": pos, "negative": neg, "total": total,
                 "score_percent": score,
                 "userscore": safe_int(spy.get("userscore")),
             },
@@ -950,8 +854,6 @@ def build_full_record(
                 "review_score_desc": reviews_summary.get("review_score_desc"),
             },
         },
-
-        # Ownership / usage
         "owners_estimate": spy.get("owners"),
         "owners_min": _owners_min(spy.get("owners")),
         "ccu": safe_int(spy.get("ccu")),
@@ -961,16 +863,16 @@ def build_full_record(
             "median_forever_min": safe_int(spy.get("median_forever")),
             "median_2weeks_min": safe_int(spy.get("median_2weeks")),
         },
-
-        # Platforms
         "platforms": {
             "windows": platforms.get("windows", False),
             "mac": platforms.get("mac", False),
             "linux": platforms.get("linux", False),
         },
-        "requirements": requirements,
-
-        # Media
+        "requirements": {
+            "pc": parse_reqs(store.get("pc_requirements")),
+            "mac": parse_reqs(store.get("mac_requirements")),
+            "linux": parse_reqs(store.get("linux_requirements")),
+        },
         "images": {
             "header": store.get("header_image") or f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg",
             "capsule_616x353": f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/capsule_616x353.jpg",
@@ -980,21 +882,16 @@ def build_full_record(
             "logo": f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/logo.png",
             "page_bg": f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/page_bg_raw.jpg",
             "background": store.get("background"),
-            "background_raw": store.get("background_raw"),
         },
         "screenshots": screenshots,
         "movies": movies,
-
-        # Extra
-        "metacritic": metacritic,
+        "metacritic": store.get("metacritic"),
         "achievements_total": achievements.get("total", 0),
         "achievements_highlighted": achievements.get("highlighted", []),
         "dlc_ids": dlc_list,
         "dlc_count": len(dlc_list),
-        "content_descriptors": content_desc,
-        "support_info": support,
-
-        # Links
+        "content_descriptors": store.get("content_descriptors") or {},
+        "support_info": store.get("support_info") or {},
         "links": {
             "steam_store": f"https://store.steampowered.com/app/{appid}/",
             "steam_community": f"https://steamcommunity.com/app/{appid}/",
@@ -1004,23 +901,18 @@ def build_full_record(
             "protondb": f"https://www.protondb.com/app/{appid}",
             "steamcharts": f"https://steamcharts.com/app/{appid}",
             "itad": f"https://isthereanydeal.com/steam/app/{appid}/",
-            "howlongtobeat": f"https://howlongtobeat.com/?q={name.replace(' ', '+')}",
         },
-
-        # Downloads (GameVault)
         "downloads": dl_info,
         "has_downloads": bool(dl_info),
         "download_variants_count": (dl_info or {}).get("total_found", 0) if dl_info else 0,
         "download_links_count": (dl_info or {}).get("total_download_links", 0) if dl_info else 0,
-
-        # BFS metadata (per /simili)
         "_bfs_depth": extra.get("depth"),
         "_bfs_parent": extra.get("parent"),
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# ENRICH SINGLE GAME (tutto in parallelo)
+# ENRICH
 # ═══════════════════════════════════════════════════════════════
 async def enrich_single_game(
     http_client: httpx.AsyncClient,
@@ -1032,14 +924,11 @@ async def enrich_single_game(
     cc: str = DEFAULT_CC,
     extra: dict | None = None,
 ) -> dict:
-    """Fetch di TUTTE le info in parallelo per un singolo gioco"""
     sem_dl = asyncio.Semaphore(CONCURRENCY_DL)
 
-    # Prima steamspy per avere il nome ufficiale
     spy = await steamspy_details(http_client, appid)
     clean_name = (spy or {}).get("name") or name_hint or ""
 
-    # Poi tutto il resto in parallelo
     tasks = [
         steam_store_details(http_client, appid, lang, cc),
         steam_reviews_summary(http_client, appid),
@@ -1055,18 +944,12 @@ async def enrich_single_game(
     dl_info = results[2] if not isinstance(results[2], Exception) else None
 
     return build_full_record(
-        appid=appid,
-        spy=spy,
-        store=store,
-        reviews_summary=rev_sum,
-        dl_info=dl_info,
+        appid=appid, spy=spy, store=store,
+        reviews_summary=rev_sum, dl_info=dl_info,
         extra=extra or {"name": name_hint},
     )
 
 
-# ═══════════════════════════════════════════════════════════════
-# ENRICH MULTIPLE (per BFS results)
-# ═══════════════════════════════════════════════════════════════
 async def enrich_batch(
     http_client: httpx.AsyncClient,
     games: list[dict],
@@ -1076,11 +959,6 @@ async def enrich_batch(
     cc: str = DEFAULT_CC,
     full_details: bool = False,
 ) -> list[dict]:
-    """
-    Enrich lista di giochi in parallelo con throttling.
-    - full_details=False: solo SteamSpy + downloads (veloce per liste lunghe)
-    - full_details=True: anche Steam Store (più lento ma completo)
-    """
     sem_spy = asyncio.Semaphore(CONCURRENCY_SPY)
     sem_store = asyncio.Semaphore(CONCURRENCY_STORE)
     sem_rev = asyncio.Semaphore(CONCURRENCY_REVIEWS)
@@ -1092,7 +970,6 @@ async def enrich_batch(
 
     async def worker(g: dict):
         nonlocal done
-        # SteamSpy
         async with sem_spy:
             spy = await steamspy_details(http_client, g["appid"])
             await asyncio.sleep(DELAY_SPY)
@@ -1141,7 +1018,7 @@ async def enrich_batch(
 
 
 # ═══════════════════════════════════════════════════════════════
-# JOBS (per operazioni lunghe)
+# JOBS STORE
 # ═══════════════════════════════════════════════════════════════
 jobs: dict[str, dict] = {}
 
@@ -1158,7 +1035,6 @@ def create_job(query: str) -> str:
         "result": None,
         "error": None,
     }
-    # cleanup vecchi job (>1h)
     now = time.time()
     to_del = [
         jid for jid, j in jobs.items()
@@ -1174,28 +1050,27 @@ def create_job(query: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("🚀 SteamPeek API v5 PRO starting")
-    # pre-warm SteamSpy cache in background
+    log.info("🚀 SteamPeek API v6 starting")
+
     async def prewarm():
         try:
             async with httpx.AsyncClient(timeout=90, headers=HDR) as c:
                 await steamspy_all(c)
         except Exception as e:
             log.warning("Prewarm failed: %s", e)
+
     asyncio.create_task(prewarm())
     yield
-    log.info("👋 Shutting down")
+    log.info("👋 Shutdown")
 
 
 app = FastAPI(
-    title="SteamPeek API v5 PRO",
-    version="5.0.0",
+    title="SteamPeek API v6",
+    version="6.0.0",
     description=(
-        "Ultra-completo. Due endpoint automatici:\n\n"
-        "• **`/cerca?q=NOME`** — info complete di UN gioco\n\n"
-        "• **`/simili?q=NOME&depth=2`** — gioco + tutti i simili (BFS)\n\n"
-        "Tutto include automaticamente: SteamSpy + Steam Store + Reviews + "
-        "GameVault Downloads + Immagini + Screenshots + Trailer + DLC + ecc."
+        "Discovery Steam intelligente con paginazione automatica.\n\n"
+        "• `/cerca?q=NOME` — info complete di UN gioco\n"
+        "• `/simili?q=NOME` — gioco + TUTTI i simili (multi-pagina automatica)"
     ),
     lifespan=lifespan,
     default_response_class=ORJSONResponse,
@@ -1213,34 +1088,25 @@ app.add_middleware(
 # ═══════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ═══════════════════════════════════════════════════════════════
-
 @app.get("/")
 async def root():
     return {
-        "service": "SteamPeek API v5 PRO",
-        "version": "5.0.0",
+        "service": "SteamPeek API v6",
+        "version": "6.0.0",
         "endpoints": {
-            "cerca": {
-                "url": "GET /cerca?q=NOME",
-                "desc": "Info COMPLETE di un singolo gioco (SteamSpy + Store + Reviews + Downloads)",
-                "example": "/cerca?q=Hollow+Knight",
-            },
-            "simili": {
-                "url": "GET /simili?q=NOME&depth=2",
-                "desc": "Gioco + tutti i simili trovati via BFS, con downloads automatici",
-                "example": "/simili?q=Hollow+Knight&depth=2&full=true",
-            },
-            "simili_async": {
-                "url": "POST /simili/async?q=NOME&depth=3",
-                "desc": "Versione asincrona per depth alti. Poll /jobs/{id}",
-            },
-            "resolve": {
-                "url": "GET /resolve?q=NOME",
-                "desc": "Solo lookup nome → appid (veloce)",
-            },
+            "cerca": "GET /cerca?q=NOME",
+            "simili": "GET /simili?q=NOME&depth=2",
+            "simili_async": "POST /simili/async?q=NOME&depth=3",
+            "resolve": "GET /resolve?q=NOME",
         },
         "docs": "/docs",
         "health": "/health",
+        "features": [
+            "Paginazione automatica SteamPeek",
+            "Match intelligente GameVault",
+            "SteamSpy + Steam Store + Reviews",
+            "Cache in-memory + file",
+        ],
     }
 
 
@@ -1248,23 +1114,19 @@ async def root():
 async def health():
     return {
         "status": "ok",
-        "service": "steampeek-api",
-        "version": "5.0.0",
+        "version": "6.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "cache_entries": len(_memory_cache),
-        "active_jobs": len([j for j in jobs.values() if j["status"] == "running"]),
+        "active_jobs": sum(1 for j in jobs.values() if j["status"] == "running"),
     }
 
 
-# ─────────────────────────────────────────────────
-# /resolve — solo lookup veloce
-# ─────────────────────────────────────────────────
 @app.get("/resolve")
-async def endpoint_resolve(q: str = Query(..., description="Game name")):
+async def endpoint_resolve(q: str = Query(...)):
     async with httpx.AsyncClient(timeout=60, headers=HDR) as c:
         appid, name = await resolve_appid(c, q)
     if not appid:
-        raise HTTPException(404, detail=f"Cannot resolve: '{q}'")
+        raise HTTPException(404, detail=f"Non trovato: '{q}'")
     return {
         "query": q,
         "appid": appid,
@@ -1273,29 +1135,17 @@ async def endpoint_resolve(q: str = Query(..., description="Game name")):
     }
 
 
-# ─────────────────────────────────────────────────
-# /cerca — SINGOLO gioco con TUTTE le info
-# ─────────────────────────────────────────────────
 @app.get("/cerca")
 async def endpoint_cerca(
-    q: str = Query(..., description="Nome del gioco o AppID"),
-    lang: str = Query(DEFAULT_LANG, description="Lingua Steam Store (italian, english, ...)"),
-    cc: str = Query(DEFAULT_CC, description="Country code (IT, US, ...)"),
-    downloads: bool = Query(True, description="Includi ricerca download GameVault"),
-    dl_max: int = Query(10, ge=1, le=30, description="Max varianti download"),
+    q: str = Query(..., description="Nome gioco o AppID"),
+    lang: str = Query(DEFAULT_LANG),
+    cc: str = Query(DEFAULT_CC),
+    downloads: bool = Query(True),
+    dl_max: int = Query(10, ge=1, le=30),
 ):
-    """
-    Cerca UN singolo gioco per nome (o AppID).
-    Restituisce TUTTE le informazioni disponibili:
-    - Metadata SteamSpy (owners, playtime, tags, reviews)
-    - Metadata Steam Store (descrizione, screenshots, trailer, requisiti, DLC, prezzi locali)
-    - Steam Reviews summary
-    - Download links automatici (GameVault)
-    - Tutte le immagini CDN + link esterni utili
-    """
+    """Info complete di UN gioco (SteamSpy + Store + Reviews + Downloads)."""
     t0 = time.time()
 
-    # Se q è un numero → AppID diretto
     try:
         appid = int(q.strip())
         name_hint = None
@@ -1303,174 +1153,208 @@ async def endpoint_cerca(
         async with httpx.AsyncClient(timeout=60, headers=HDR) as c:
             appid, name_hint = await resolve_appid(c, q)
         if not appid:
-            raise HTTPException(404, detail=f"Gioco non trovato: '{q}'")
+            raise HTTPException(404, detail=f"Non trovato: '{q}'")
 
-    async with httpx.AsyncClient(timeout=TIMEOUT, headers=HDR, follow_redirects=True) as c:
-        record = await enrich_single_game(
-            c, appid,
-            name_hint=name_hint,
-            include_downloads=downloads,
-            dl_max=dl_max,
-            lang=lang,
-            cc=cc,
-        )
+    try:
+        async with httpx.AsyncClient(
+            timeout=TIMEOUT, headers=HDR, follow_redirects=True
+        ) as c:
+            record = await enrich_single_game(
+                c, appid,
+                name_hint=name_hint,
+                include_downloads=downloads,
+                dl_max=dl_max,
+                lang=lang, cc=cc,
+            )
 
-    return {
-        "query": q,
-        "resolved_appid": appid,
-        "elapsed_seconds": round(time.time() - t0, 2),
-        "game": record,
-    }
+        return {
+            "ok": True,
+            "query": q,
+            "resolved_appid": appid,
+            "elapsed_seconds": round(time.time() - t0, 2),
+            "game": record,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Errore /cerca")
+        raise HTTPException(500, detail={"error": str(e), "query": q})
 
 
-# ─────────────────────────────────────────────────
-# /simili — gioco + BFS di tutti i simili
-# ─────────────────────────────────────────────────
 @app.get("/simili")
 async def endpoint_simili(
-    q: str = Query(..., description="Nome del gioco (o AppID)"),
-    depth: int = Query(2, ge=1, le=4, description="Profondità BFS (1-4)"),
-    max_total: Optional[int] = Query(None, ge=1, alias="max", description="Max giochi trovati. Nell\'URL usa ?max=50"),
+    q: str = Query(..., description="Nome gioco o AppID"),
+    depth: int = Query(2, ge=1, le=4, description="Profondità BFS 1-4"),
+    max_total: Optional[int] = Query(
+        None, ge=1, alias="max",
+        description="Max giochi totali (URL: ?max=200)",
+    ),
+    max_pages_per_game: int = Query(
+        5, ge=1, le=20,
+        description="Max pagine SteamPeek per gioco (default 5)",
+    ),
     lang: str = Query(DEFAULT_LANG),
     cc: str = Query(DEFAULT_CC),
-    downloads: bool = Query(True, description="Ricerca download automatica"),
-    dl_max: int = Query(5, ge=1, le=20, description="Max varianti DL per gioco"),
-    full: bool = Query(
-        False,
-        description="Se true, fetch anche Steam Store per OGNI simile (più lento ma completo)",
-    ),
-    sort: str = Query("depth", description="Sort: depth|name|date|score|reviews|price|downloads|owners"),
-    desc: bool = Query(False, description="Ordine decrescente"),
-    min_score: float = Query(0, ge=0, le=100, description="Filtra score minimo %"),
-    min_reviews: int = Query(0, ge=0, description="Filtra reviews minime"),
+    downloads: bool = Query(True),
+    dl_max: int = Query(5, ge=1, le=20),
+    full: bool = Query(False, description="Fetch Steam Store per ogni simile"),
+    sort: str = Query("depth"),
+    desc: bool = Query(False),
+    min_score: float = Query(0, ge=0, le=100),
+    min_reviews: int = Query(0, ge=0),
     free_only: bool = Query(False),
     paid_only: bool = Query(False),
-    dl_only: bool = Query(False, description="Solo giochi con download disponibili"),
-    limit: Optional[int] = Query(None, ge=1, description="Limit risultati finali"),
+    dl_only: bool = Query(False),
+    limit: Optional[int] = Query(None, ge=1),
 ):
     """
-    Trova un gioco + TUTTI i simili via BFS su SteamPeek.
-    - Ogni gioco viene arricchito con SteamSpy + downloads GameVault
-    - Con `full=true` anche Steam Store data (descrizione, screenshots, ecc)
-    - Include il gioco seed come primo elemento con tutti i dettagli
+    Gioco + TUTTI i simili trovati (paginazione automatica SteamPeek).
+    Esempi:
+      /simili?q=DayZ&depth=1
+      /simili?q=DayZ&depth=2&max=200
+      /simili?q=DayZ&depth=2&full=true&dl_only=true
     """
     t0 = time.time()
 
-    async with (
-        httpx.AsyncClient(timeout=TIMEOUT, headers=HDR, follow_redirects=True) as http_client,
-        CurlAsync(impersonate=IMPERSONATE) as peek_client,
-    ):
-        # Warmup SteamPeek
-        try:
-            await peek_client.get(BASE_URL + "/", timeout=TIMEOUT)
-        except Exception:
-            pass
+    try:
+        async with (
+            httpx.AsyncClient(
+                timeout=TIMEOUT, headers=HDR, follow_redirects=True
+            ) as http_client,
+            CurlAsync(impersonate=IMPERSONATE) as peek_client,
+        ):
+            try:
+                await peek_client.get(BASE_URL + "/", timeout=TIMEOUT)
+            except Exception as e:
+                log.warning("Warmup failed: %s", e)
 
-        # Resolve
-        try:
-            appid = int(q.strip())
-            seed_name = q
-        except ValueError:
-            appid, seed_name = await resolve_appid(http_client, q)
-            if not appid:
-                raise HTTPException(404, detail=f"Gioco non trovato: '{q}'")
+            try:
+                appid = int(q.strip())
+                seed_name = q
+            except ValueError:
+                appid, seed_name = await resolve_appid(http_client, q)
+                if not appid:
+                    raise HTTPException(404, detail=f"Non trovato: '{q}'")
 
-        log.info("Seed: %s (appid=%d)", seed_name, appid)
+            log.info("Seed: %s appid=%s", seed_name, appid)
 
-        # BFS
-        t1 = time.time()
-        discovered = await bfs_discover(
+            t1 = time.time()
+            discovered = await bfs_discover(
                 peek_client, appid, seed_name, depth, max_total,
                 max_pages_per_game=max_pages_per_game,
             )
-        t2 = time.time()
-        log.info("BFS: %d giochi trovati in %.2fs", len(discovered), t2 - t1)
+            t2 = time.time()
+            log.info("BFS: %d games in %.2fs", len(discovered), t2 - t1)
 
-        # Enrichment (seed + simili in parallelo)
-        seed_task = enrich_single_game(
-            http_client, appid,
-            name_hint=seed_name,
-            include_downloads=downloads,
-            dl_max=(dl_max if dl_max >= 10 else 10),  # più varianti per il seed
-            lang=lang, cc=cc,
-            extra={"depth": 0, "parent": None, "name": seed_name},
-        )
-        similar_task = enrich_batch(
-            http_client, discovered,
-            include_downloads=downloads,
-            dl_max=dl_max,
-            lang=lang, cc=cc,
-            full_details=full,
-        )
-        seed_record, similar_records = await asyncio.gather(seed_task, similar_task)
-        t3 = time.time()
-        log.info("Enrichment: %d records in %.2fs", len(similar_records) + 1, t3 - t2)
+            seed_dl_max = dl_max if dl_max >= 10 else 10
 
-    # Filtering
-    def filter_ok(g: dict) -> bool:
-        rev = (g.get("reviews") or {}).get("steamspy") or {}
-        if min_reviews and (rev.get("total") or 0) < min_reviews:
-            return False
-        if min_score and (rev.get("score_percent") or 0) < min_score:
-            return False
-        pr = g.get("price") or {}
-        if free_only and not pr.get("is_free"):
-            return False
-        if paid_only and pr.get("is_free"):
-            return False
-        if dl_only and not g.get("has_downloads"):
-            return False
-        return True
+            seed_task = enrich_single_game(
+                http_client, appid,
+                name_hint=seed_name,
+                include_downloads=downloads,
+                dl_max=seed_dl_max,
+                lang=lang, cc=cc,
+                extra={"depth": 0, "parent": None, "name": seed_name},
+            )
+            similar_task = enrich_batch(
+                http_client, discovered,
+                include_downloads=downloads,
+                dl_max=dl_max,
+                lang=lang, cc=cc,
+                full_details=full,
+            )
+            seed_record, similar_records = await asyncio.gather(
+                seed_task, similar_task
+            )
+            t3 = time.time()
+            log.info(
+                "Enrichment: %d records in %.2fs",
+                len(similar_records) + 1, t3 - t2,
+            )
 
-    filtered = [g for g in similar_records if filter_ok(g)]
+        def filter_ok(g: dict) -> bool:
+            rev = ((g.get("reviews") or {}).get("steamspy") or {})
+            if min_reviews and (rev.get("total") or 0) < min_reviews:
+                return False
+            if min_score and (rev.get("score_percent") or 0) < min_score:
+                return False
+            pr = g.get("price") or {}
+            if free_only and not pr.get("is_free"):
+                return False
+            if paid_only and pr.get("is_free"):
+                return False
+            if dl_only and not g.get("has_downloads"):
+                return False
+            return True
 
-    # Sort
-    SORT_KEYS = {
-        "depth": lambda x: (x.get("_bfs_depth") or 99, (x.get("name") or "").lower()),
-        "name": lambda x: (x.get("name") or "").lower(),
-        "date": lambda x: x.get("release_ts") or 0,
-        "score": lambda x: ((x.get("reviews") or {}).get("steamspy") or {}).get("score_percent") or 0,
-        "reviews": lambda x: ((x.get("reviews") or {}).get("steamspy") or {}).get("total") or 0,
-        "price": lambda x: (x.get("price") or {}).get("final") or 0,
-        "downloads": lambda x: (x.get("downloads") or {}).get("total_found") or 0,
-        "owners": lambda x: x.get("owners_min") or 0,
-    }
-    key = SORT_KEYS.get(sort, SORT_KEYS["depth"])
-    filtered.sort(key=key, reverse=desc)
+        filtered = [g for g in similar_records if filter_ok(g)]
 
-    if limit:
-        filtered = filtered[:limit]
+        SORT_KEYS = {
+            "depth": lambda x: (
+                x.get("_bfs_depth") if x.get("_bfs_depth") is not None else 99,
+                (x.get("name") or "").lower(),
+            ),
+            "name": lambda x: (x.get("name") or "").lower(),
+            "date": lambda x: x.get("release_ts") or 0,
+            "score": lambda x: (
+                ((x.get("reviews") or {}).get("steamspy") or {}).get("score_percent") or 0
+            ),
+            "reviews": lambda x: (
+                ((x.get("reviews") or {}).get("steamspy") or {}).get("total") or 0
+            ),
+            "price": lambda x: (x.get("price") or {}).get("final") or 0,
+            "downloads": lambda x: (x.get("downloads") or {}).get("total_found") or 0,
+            "owners": lambda x: x.get("owners_min") or 0,
+        }
+        key = SORT_KEYS.get(sort, SORT_KEYS["depth"])
+        filtered.sort(key=key, reverse=desc)
 
-    with_dl = sum(1 for r in filtered if r.get("has_downloads"))
+        if limit:
+            filtered = filtered[:limit]
 
-    return {
-        "query": q,
-        "resolved_appid": appid,
-        "seed": seed_record,
-        "similar": filtered,
-        "stats": {
-            "total_discovered": len(discovered),
-            "total_after_filter": len(filtered),
-            "with_downloads": with_dl,
-            "download_rate_pct": round(with_dl * 100 / max(len(filtered), 1), 1),
-            "elapsed_seconds": round(time.time() - t0, 2),
-            "params": {
-                "depth": depth, "max": max_total, "sort": sort, "desc": desc,
-                "full_details": full, "downloads": downloads,
+        with_dl = sum(1 for r in filtered if r.get("has_downloads"))
+
+        return {
+            "ok": True,
+            "query": q,
+            "resolved_appid": appid,
+            "seed": seed_record,
+            "similar": filtered,
+            "stats": {
+                "total_discovered": len(discovered),
+                "total_after_filter": len(filtered),
+                "with_downloads": with_dl,
+                "download_rate_pct": round(with_dl * 100 / max(len(filtered), 1), 1),
+                "elapsed_seconds": round(time.time() - t0, 2),
+                "params": {
+                    "depth": depth,
+                    "max": max_total,
+                    "max_pages_per_game": max_pages_per_game,
+                    "sort": sort,
+                    "desc": desc,
+                    "full_details": full,
+                    "downloads": downloads,
+                },
             },
-        },
-    }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Errore /simili")
+        raise HTTPException(
+            500,
+            detail={"error": "simili_failed", "message": str(e), "query": q},
+        )
 
 
-# ─────────────────────────────────────────────────
-# /simili/async — versione job asincrona
-# ─────────────────────────────────────────────────
 @app.post("/simili/async")
 async def endpoint_simili_async(
     background: BackgroundTasks,
     q: str = Query(...),
     depth: int = Query(3, ge=1, le=4),
-    max: Optional[int] = Query(None, ge=1),
+    max_total: Optional[int] = Query(None, ge=1, alias="max"),
+    max_pages_per_game: int = Query(5, ge=1, le=20),
     lang: str = Query(DEFAULT_LANG),
     cc: str = Query(DEFAULT_CC),
     downloads: bool = Query(True),
@@ -1479,17 +1363,16 @@ async def endpoint_simili_async(
     sort: str = Query("depth"),
     desc: bool = Query(False),
 ):
-    """
-    Avvia ricerca simili in background.
-    Restituisce job_id → poll GET /jobs/{job_id}.
-    """
+    """Job background per ricerche pesanti. Poll /jobs/{id}."""
     job_id = create_job(q)
 
     async def run():
         try:
             jobs[job_id]["progress"] = "Resolving..."
             async with (
-                httpx.AsyncClient(timeout=TIMEOUT, headers=HDR, follow_redirects=True) as http_c,
+                httpx.AsyncClient(
+                    timeout=TIMEOUT, headers=HDR, follow_redirects=True
+                ) as http_c,
                 CurlAsync(impersonate=IMPERSONATE) as peek_c,
             ):
                 try:
@@ -1503,18 +1386,19 @@ async def endpoint_simili_async(
                 except ValueError:
                     appid, seed_name = await resolve_appid(http_c, q)
                     if not appid:
-                        raise RuntimeError(f"Cannot resolve: {q}")
+                        raise RuntimeError(f"Non trovato: {q}")
 
                 jobs[job_id]["progress"] = f"BFS depth={depth}..."
                 discovered = await bfs_discover(
-                peek_c, appid, seed_name, depth, max_total,
-                max_pages_per_game=max_pages_per_game,
-            )
+                    peek_c, appid, seed_name, depth, max_total,
+                    max_pages_per_game=max_pages_per_game,
+                )
 
-                jobs[job_id]["progress"] = f"Enriching {len(discovered) + 1} games..."
+                jobs[job_id]["progress"] = f"Enriching {len(discovered)+1} games..."
+                seed_dl_max = dl_max if dl_max >= 10 else 10
                 seed_task = enrich_single_game(
                     http_c, appid, name_hint=seed_name,
-                    include_downloads=downloads, dl_max=(dl_max if dl_max >= 10 else 10),
+                    include_downloads=downloads, dl_max=seed_dl_max,
                     lang=lang, cc=cc,
                     extra={"depth": 0, "parent": None, "name": seed_name},
                 )
@@ -1526,11 +1410,18 @@ async def endpoint_simili_async(
                 seed_rec, sim_recs = await asyncio.gather(seed_task, sim_task)
 
             SORT_KEYS = {
-                "depth": lambda x: (x.get("_bfs_depth") or 99, (x.get("name") or "").lower()),
+                "depth": lambda x: (
+                    x.get("_bfs_depth") if x.get("_bfs_depth") is not None else 99,
+                    (x.get("name") or "").lower(),
+                ),
                 "name": lambda x: (x.get("name") or "").lower(),
                 "date": lambda x: x.get("release_ts") or 0,
-                "score": lambda x: ((x.get("reviews") or {}).get("steamspy") or {}).get("score_percent") or 0,
-                "reviews": lambda x: ((x.get("reviews") or {}).get("steamspy") or {}).get("total") or 0,
+                "score": lambda x: (
+                    ((x.get("reviews") or {}).get("steamspy") or {}).get("score_percent") or 0
+                ),
+                "reviews": lambda x: (
+                    ((x.get("reviews") or {}).get("steamspy") or {}).get("total") or 0
+                ),
                 "downloads": lambda x: (x.get("downloads") or {}).get("total_found") or 0,
             }
             sim_recs.sort(key=SORT_KEYS.get(sort, SORT_KEYS["depth"]), reverse=desc)
@@ -1542,7 +1433,9 @@ async def endpoint_simili_async(
                 "similar": sim_recs,
                 "stats": {
                     "total": len(sim_recs),
-                    "with_downloads": sum(1 for r in sim_recs if r.get("has_downloads")),
+                    "with_downloads": sum(
+                        1 for r in sim_recs if r.get("has_downloads")
+                    ),
                 },
             }
         except Exception as e:
@@ -1570,8 +1463,13 @@ async def list_jobs():
     return {
         "total": len(jobs),
         "jobs": [
-            {"id": j["id"], "status": j["status"], "query": j["query"],
-             "started_at": j["started_at"], "progress": j.get("progress")}
+            {
+                "id": j["id"],
+                "status": j["status"],
+                "query": j["query"],
+                "started_at": j["started_at"],
+                "progress": j.get("progress"),
+            }
             for j in jobs.values()
         ],
     }
